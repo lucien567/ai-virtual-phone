@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useContext, useCallback, useMemo } from "react";
-import { Plus, Upload, Download, Trash2, RotateCcw, ChevronLeft, ChevronDown, GripVertical, MessageSquare, AlertCircle, Maximize2, Copy, Replace } from "lucide-react";
+import { Plus, Upload, Download, Trash2, RotateCcw, ChevronLeft, ChevronDown, GripVertical, MessageSquare, AlertCircle, Maximize2, Copy, Replace, ArrowRightLeft } from "lucide-react";
 import {
     loadPresets,
     savePresets,
@@ -84,6 +84,14 @@ function matchMarkerByName(name: string): string | null {
     return MARKER_NAMES_NORMALIZED[normalizeMarkerName(name)] ?? null;
 }
 
+function makeUniquePromptIdentifier(identifier: string, used: Set<string>): string {
+    const base = identifier.trim() || `prompt-${Date.now()}`;
+    if (!used.has(base)) return base;
+    let suffix = 1;
+    while (used.has(`${base}_copy_${suffix}`)) suffix += 1;
+    return `${base}_copy_${suffix}`;
+}
+
 const MASCOT_PRESET_STORAGE_TOOL_NAMES = new Set([
     "创建剧情预设",
     "克隆内置预设",
@@ -130,6 +138,9 @@ export function PresetManager({ isActive = true }: { isActive?: boolean } = {}) 
     const [expandTarget, setExpandTarget] = useState<{ identifier: string; field: string } | null>(null);
     const [importError, setImportError] = useState<string | null>(null);
     const [customApps, setCustomApps] = useState<InstalledCustomApp[]>([]);
+    const [transferEntry, setTransferEntry] = useState<{ presetId: string; identifier: string } | null>(null);
+    const [transferMode, setTransferMode] = useState<"copy" | "move">("copy");
+    const [transferError, setTransferError] = useState<string | null>(null);
 
     const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -449,6 +460,73 @@ export function PresetManager({ isActive = true }: { isActive?: boolean } = {}) 
             prompt.identifier === promptId ? updater(prompt) : prompt,
         );
         updatePreset(preset.id, { ...updates, prompts: newPrompts });
+    };
+
+    const transferPromptToPreset = (targetPresetId: string) => {
+        if (!transferEntry) return;
+        const sourcePreset = presets.find(p => p.id === transferEntry.presetId);
+        const targetPreset = presets.find(p => p.id === targetPresetId);
+        const sourcePrompt = sourcePreset?.prompts.find(p => p.identifier === transferEntry.identifier);
+        if (!sourcePreset || !targetPreset || !sourcePrompt || sourcePreset.id === targetPreset.id) return;
+
+        const targetIdentifiers = new Set(targetPreset.prompts.map(p => p.identifier));
+        if (sourcePrompt.marker && targetIdentifiers.has(sourcePrompt.identifier)) {
+            setTransferEntry(null);
+            setTransferError(`“${targetPreset.name}”中已有同类型 Marker，不能重复添加。`);
+            return;
+        }
+
+        const nextIdentifier = sourcePrompt.marker
+            ? sourcePrompt.identifier
+            : makeUniquePromptIdentifier(sourcePrompt.identifier, targetIdentifiers);
+        const copiedPrompt: Prompt = {
+            ...sourcePrompt,
+            identifier: nextIdentifier,
+            tags: sourcePrompt.tags ? [...sourcePrompt.tags] : undefined,
+        };
+        const sourceEnabled = sourcePreset.prompt_order
+            ?.find(entry => entry.identifier === sourcePrompt.identifier)?.enabled ?? sourcePrompt.enabled;
+
+        const targetOrder: PromptOrderEntry[] = [];
+        const orderedTargetIds = new Set<string>();
+        for (const entry of targetPreset.prompt_order ?? []) {
+            if (!targetIdentifiers.has(entry.identifier) || orderedTargetIds.has(entry.identifier)) continue;
+            orderedTargetIds.add(entry.identifier);
+            targetOrder.push({ ...entry });
+        }
+        for (const prompt of targetPreset.prompts) {
+            if (orderedTargetIds.has(prompt.identifier)) continue;
+            orderedTargetIds.add(prompt.identifier);
+            targetOrder.push({ identifier: prompt.identifier, enabled: prompt.enabled });
+        }
+        targetOrder.push({ identifier: nextIdentifier, enabled: sourceEnabled });
+
+        const now = Date.now();
+        const nextPresets = presets.map(preset => {
+            if (preset.id === targetPreset.id) {
+                return {
+                    ...preset,
+                    prompts: [...preset.prompts, copiedPrompt],
+                    prompt_order: targetOrder,
+                    updatedAt: now,
+                };
+            }
+            if (transferMode === "move" && preset.id === sourcePreset.id) {
+                return {
+                    ...preset,
+                    prompts: preset.prompts.filter(prompt => prompt.identifier !== sourcePrompt.identifier),
+                    prompt_order: preset.prompt_order?.filter(entry => entry.identifier !== sourcePrompt.identifier),
+                    updatedAt: now,
+                };
+            }
+            return preset;
+        });
+
+        persist(nextPresets);
+        if (transferMode === "move" && editingPromptId === sourcePrompt.identifier) {
+            setEditingPromptId(null);
+        }
+        setTransferEntry(null);
     };
 
     // ── Prompt reorder (shared by HTML5 drag & touch sort) ──
@@ -1026,6 +1104,19 @@ export function PresetManager({ isActive = true }: { isActive?: boolean } = {}) 
                                                             <button
                                                                 type="button"
                                                                 className="ui-swipe-action"
+                                                                data-variant="replace"
+                                                                onClick={() => {
+                                                                    setTransferMode("copy");
+                                                                    setTransferEntry({ presetId: preset.id, identifier: prompt.identifier });
+                                                                    swipe.close();
+                                                                }}
+                                                            >
+                                                                <ArrowRightLeft size={18} strokeWidth={2} />
+                                                                <span>转移</span>
+                                                            </button>
+                                                            <button
+                                                                type="button"
+                                                                className="ui-swipe-action"
                                                                 data-variant="export"
                                                                 onClick={() => {
                                                                     exportPrompt(prompt);
@@ -1426,6 +1517,68 @@ export function PresetManager({ isActive = true }: { isActive?: boolean } = {}) 
                         setConfirmDeleteEntry(null);
                     }}
                     onCancel={() => setConfirmDeleteEntry(null)}
+                />
+            )}
+
+            {transferEntry && (() => {
+                const sourcePreset = presets.find(preset => preset.id === transferEntry.presetId);
+                const sourcePrompt = sourcePreset?.prompts.find(prompt => prompt.identifier === transferEntry.identifier);
+                if (!sourcePreset || !sourcePrompt) return null;
+                const targets = presets.filter(preset => preset.id !== sourcePreset.id);
+                return (
+                    <BottomSheet title="转移条目" onClose={() => setTransferEntry(null)}>
+                        <div className="flex flex-col gap-3">
+                            <div className="menu-desc px-1">
+                                {sourcePrompt.name || "未命名提示词"}
+                            </div>
+                            <div className="grid grid-cols-2 gap-2" role="group" aria-label="转移方式">
+                                <button
+                                    type="button"
+                                    className={transferMode === "copy" ? "ui-btn ui-btn-primary w-full" : "ui-btn ui-btn-outline w-full"}
+                                    onClick={() => setTransferMode("copy")}
+                                >
+                                    <Copy size={16} /> 复制
+                                </button>
+                                <button
+                                    type="button"
+                                    className={transferMode === "move" ? "ui-btn ui-btn-primary w-full" : "ui-btn ui-btn-outline w-full"}
+                                    onClick={() => setTransferMode("move")}
+                                >
+                                    <ArrowRightLeft size={16} /> 移动
+                                </button>
+                            </div>
+                            <div className="flex flex-col gap-2">
+                                <span className="menu-label ts-13 font-semibold px-1">选择目标预设</span>
+                                {targets.map(target => (
+                                    <button
+                                        key={target.id}
+                                        type="button"
+                                        className="ui-btn ui-btn-outline w-full justify-between"
+                                        onClick={() => transferPromptToPreset(target.id)}
+                                    >
+                                        <span className="truncate">{target.name || "未命名预设"}</span>
+                                        <span className="menu-desc shrink-0">{target.prompts.length} 条</span>
+                                    </button>
+                                ))}
+                                {targets.length === 0 && (
+                                    <div className="menu-desc text-center p-3">请先创建另一份预设。</div>
+                                )}
+                            </div>
+                        </div>
+                    </BottomSheet>
+                );
+            })()}
+
+            {transferError && (
+                <ConfirmDialog
+                    title="无法转移条目"
+                    message={transferError}
+                    icon={AlertCircle}
+                    variant="danger"
+                    confirmLabel="知道了"
+                    cancelLabel=""
+                    onConfirm={() => setTransferError(null)}
+                    onCancel={() => setTransferError(null)}
                 />
             )}
 
